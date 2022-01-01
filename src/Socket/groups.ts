@@ -124,7 +124,7 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 			const inviteNode = getBinaryNodeChild(result, 'invite')
 			return inviteNode.attrs.code
 		},
-	        groupRevokeInvite: async (jid: string) => {
+		groupRevokeInvite: async (jid: string) => {
 			const result = await groupQuery(jid, 'set', [{ tag: 'invite', attrs: {} }])
 			const inviteNode = getBinaryNodeChild(result, 'invite')
 			return inviteNode.attrs.code
@@ -199,8 +199,8 @@ export const extractGroupMetadata = (result: BinaryNode) => {
 		owner: group.attrs.creator ? jidNormalizedUser(group.attrs.creator) : undefined,
 		desc,
 		descId,
-		restrict: !!getBinaryNodeChild(result, 'locked'),
-		announce: !!getBinaryNodeChild(result, 'announcement'),
+		restrict: !!getBinaryNodeChild(group, 'locked'),
+		announce: !!getBinaryNodeChild(group, 'announcement'),
 		participants: getBinaryNodeChildren(group, 'participant').map(
 			({ attrs }) => {
 				return {

@@ -1,22 +1,16 @@
 import P from "pino"
 import { Boom } from "@hapi/boom"
-import makeWASocket, { DisconnectReason, AnyMessageContent, delay, useSingleFileAuthState } from '../src'
+import { makeWALegacySocket, DisconnectReason, AnyMessageContent, delay, useSingleFileLegacyAuthState } from '../src'
 
-const { state, saveState } = useSingleFileAuthState('./auth_info_multi.json')
+const { state, saveState } = useSingleFileLegacyAuthState('./auth_info.json')
 
 // start a connection
 const startSock = () => {
     
-    const sock = makeWASocket({
-        logger: P({ level: 'trace' }),
+    const sock = makeWALegacySocket({
+        logger: P({ level: 'debug' }),
         printQRInTerminal: true,
-        auth: state,
-        // implement to handle retries
-        getMessage: async key => {
-            return {
-                conversation: 'hello'
-            }
-        }
+        auth: state
     })
 
     const sendMessageWTyping = async(msg: AnyMessageContent, jid: string) => {
@@ -32,18 +26,20 @@ const startSock = () => {
     }
     
     sock.ev.on('messages.upsert', async m => {
-        console.log(JSON.stringify(m, undefined, 2))
+        if(m.type === 'append' || m.type === 'notify') {
+            console.log(JSON.stringify(m, undefined, 2))
+        }
         
         const msg = m.messages[0]
         if(!msg.key.fromMe && m.type === 'notify') {
             console.log('replying to', m.messages[0].key.remoteJid)
-            await sock!.sendReadReceipt(msg.key.remoteJid, msg.key.participant, [msg.key.id])
+            await sock!.chatRead(msg.key, 1)
             await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid)
         }
         
     })
 
-    sock.ev.on('messages.update', m => console.log(m))
+    sock.ev.on('messages.update', m => console.log(JSON.stringify(m, undefined, 2)))
     sock.ev.on('presence.update', m => console.log(m))
     sock.ev.on('chats.update', m => console.log(m))
     sock.ev.on('contacts.update', m => console.log(m))

@@ -1,5 +1,5 @@
 import { Boom } from '@hapi/boom'
-import { createReadStream, promises as fs } from "fs"
+import { promises as fs } from "fs"
 import { proto } from '../../WAProto'
 import { MEDIA_KEYS, URL_REGEX, WA_DEFAULT_EPHEMERAL } from "../Defaults"
 import { 
@@ -56,6 +56,8 @@ export const prepareWAMessageMedia = async(
 	message: AnyMediaMessageContent, 
 	options: MediaGenerationOptions
 ) => {
+	const logger = options.logger
+
 	let mediaType: typeof MEDIA_KEYS[number]
 	for(const key of MEDIA_KEYS) {
 		if(key in message) {
@@ -64,9 +66,9 @@ export const prepareWAMessageMedia = async(
 	}
 	const uploadData: MediaUploadData = { 
 		...message,
-		[mediaType]: undefined,
 		media: message[mediaType]
 	}
+	delete uploadData[mediaType]
 	// check if cacheable + generate cache key
 	const cacheableKey = typeof uploadData.media === 'object' && 
 			('url' in uploadData.media) && 
@@ -75,26 +77,37 @@ export const prepareWAMessageMedia = async(
 				// generate the key
 				mediaType + ':' + uploadData.media.url!.toString()
 			)
-	// check for cache hit
-	if(cacheableKey) {
-		const mediaBuff: Buffer = options.mediaCache!.get(cacheableKey)
-		if(mediaBuff) {
-			return WAProto.Message.decode(mediaBuff)
-		}
-	}
+
 	if(mediaType === 'document' && !uploadData.fileName) {
 		uploadData.fileName = 'file'
 	}
 	if(!uploadData.mimetype) {
 		uploadData.mimetype = MIMETYPE_MAP[mediaType]
 	}
+
+	// check for cache hit
+	if(cacheableKey) {
+		const mediaBuff: Buffer = options.mediaCache!.get(cacheableKey)
+		if(mediaBuff) {
+			logger?.debug({ cacheableKey }, `got media cache hit`)
+			
+			const obj = WAProto.Message.decode(mediaBuff)
+			const key = `${mediaType}Message`
+
+			delete uploadData.media
+			Object.assign(obj[key], { ...uploadData })
+
+			return obj
+		}
+	}
+
 	const requiresDurationComputation = mediaType === 'audio' && typeof uploadData.seconds === 'undefined'
 	const requiresThumbnailComputation = (mediaType === 'image' || mediaType === 'video') && 
 										(typeof uploadData['jpegThumbnail'] === 'undefined')
 	const requiresOriginalForSomeProcessing = requiresDurationComputation || requiresThumbnailComputation
 	const {
 		mediaKey,
-		encBodyPath,
+		encWriteStream,
 		bodyPath,
 		fileEncSha256,
 		fileSha256,
@@ -108,28 +121,42 @@ export const prepareWAMessageMedia = async(
 		.replace(/\//g, '_')
 		.replace(/\=+$/, '')
 	)
-	try {
-		if(requiresThumbnailComputation) {
-			uploadData.jpegThumbnail = await generateThumbnail(bodyPath, mediaType as any, options)
+
+	const [{ mediaUrl, directPath }] = await Promise.all([
+		(async() => {
+			const result = await options.upload(
+				encWriteStream,
+				{ fileEncSha256B64, mediaType, timeoutMs: options.mediaUploadTimeoutMs }
+			)
+			logger?.debug(`uploaded media`)
+			return result
+		})(),
+		(async() => {
+			try {
+				if(requiresThumbnailComputation) {
+					uploadData.jpegThumbnail = await generateThumbnail(bodyPath, mediaType as any, options)
+					logger?.debug(`generated thumbnail`)
+				}
+				if (requiresDurationComputation) {
+					uploadData.seconds = await getAudioDuration(bodyPath)
+					logger?.debug(`computed audio duration`)
+				}
+			} catch (error) {
+				logger?.warn({ trace: error.stack }, 'failed to obtain extra info')
+			}
+		})(),
+	])
+	.finally(
+		async() => {
+			encWriteStream.destroy()
+			// remove tmp files
+			if(didSaveToTmpPath && bodyPath) {
+				await fs.unlink(bodyPath)
+				logger?.debug('removed tmp files')
+			}
 		}
-		if (requiresDurationComputation) {
-			uploadData.seconds = await getAudioDuration(bodyPath)
-		}
-	} catch (error) {
-		options.logger?.info({ trace: error.stack }, 'failed to obtain extra info')
-	}
-	const {mediaUrl, directPath} = await options.upload(
-		createReadStream(encBodyPath),
-		{ fileEncSha256B64, mediaType, timeoutMs: options.mediaUploadTimeoutMs }
 	)
-	// remove tmp files
-	await Promise.all(
-		[
-			fs.unlink(encBodyPath),
-			didSaveToTmpPath && bodyPath && fs.unlink(bodyPath)
-		]
-		.filter(Boolean)
-	)
+
 	delete uploadData.media
 
 	const obj = WAProto.Message.fromObject({
@@ -148,6 +175,7 @@ export const prepareWAMessageMedia = async(
 	})
 
 	if(cacheableKey) {
+		logger.debug({ cacheableKey }, `set cache`)
 		options.mediaCache!.set(cacheableKey, WAProto.Message.encode(obj).finish())
 	}
 
@@ -178,7 +206,8 @@ export const generateForwardMessageContent = (
 ) => {
 	let content = message.message
 	if (!content) throw new Boom('no content in message', { statusCode: 400 })
-	content = JSON.parse(JSON.stringify(content)) // hacky copy
+	// hacky copy
+	content = proto.Message.decode(proto.Message.encode(message.message).finish())
 
 	let key = Object.keys(content)[0] as MessageType
 
@@ -271,14 +300,14 @@ export const generateWAMessageContent = async(
 		}
 
 		m = { buttonsMessage }
-	} else if ('templateButtons' in message && !!message.templateButtons) {
+	} else if('templateButtons' in message && !!message.templateButtons) {
 		const templateMessage: proto.ITemplateMessage = {
 			hydratedTemplate: {
 				hydratedButtons: message.templateButtons
 			}
 		}
 		
-		if ('text' in message) {
+		if('text' in message) {
 			templateMessage.hydratedTemplate.hydratedContentText = message.text
 		} else {
 
@@ -289,11 +318,24 @@ export const generateWAMessageContent = async(
 			Object.assign(templateMessage.hydratedTemplate, m)
 		}
 
-		if ('footer' in message && !!message.footer) {
+		if('footer' in message && !!message.footer) {
 			templateMessage.hydratedTemplate.hydratedFooterText = message.footer
 		}
 
 		m = { templateMessage }
+	}
+	
+	if ('sections' in message && !!message.sections) {
+		const listMessage: proto.IListMessage = {
+			sections: message.sections,
+			buttonText: message.buttonText,
+			title: message.title,
+			footerText: message.footer,
+			description: message.text,
+			listType: proto.ListMessage.ListMessageListType['SINGLE_SELECT']
+		}
+
+		m = { listMessage }
 	}
 
 	if('viewOnce' in message && !!message.viewOnce) {
@@ -311,13 +353,13 @@ export const generateWAMessageFromContent = (
 	message: WAMessageContent, 
 	options: MessageGenerationOptionsFromContent
 ) => {
-	if (!options.timestamp) options.timestamp = new Date() // set timestamp to now
+	if(!options.timestamp) options.timestamp = new Date() // set timestamp to now
 
 	const key = Object.keys(message)[0]
 	const timestamp = unixTimestampSeconds(options.timestamp)
 	const { quoted, userJid } = options
 
-	if (quoted) {
+	if(quoted) {
 		const participant = quoted.key.fromMe ? userJid : (quoted.participant || quoted.key.participant || quoted.key.remoteJid)
 
 		message[key].contextInfo = message[key].contextInfo || { }
@@ -327,7 +369,7 @@ export const generateWAMessageFromContent = (
 		
 		// if a participant is quoted, then it must be a group
 		// hence, remoteJid of group must also be entered
-		if (quoted.key.participant || quoted.participant) {
+		if(quoted.key.participant || quoted.participant) {
 			message[key].contextInfo.remoteJid = quoted.key.remoteJid
 		}
 	}
@@ -349,8 +391,9 @@ export const generateWAMessageFromContent = (
 				message
 			}
 		}
-	} 
-	message = WAProto.Message.fromObject (message)
+	}
+
+	message = WAProto.Message.fromObject(message)
 
 	const messageJSON = {
 		key: {
@@ -364,14 +407,16 @@ export const generateWAMessageFromContent = (
 		participant: jid.includes('@g.us') ? userJid : undefined,
 		status: WAMessageStatus.PENDING
 	}
-	return WAProto.WebMessageInfo.fromObject (messageJSON)
+	return WAProto.WebMessageInfo.fromObject(messageJSON)
 }
 export const generateWAMessage = async(
 	jid: string,
 	content: AnyMessageContent,
 	options: MessageGenerationOptions,
-) => (
-	generateWAMessageFromContent(
+) => {
+	// ensure msg ID is with every log
+	options.logger = options?.logger?.child({ msgId: options.messageId })
+	return generateWAMessageFromContent(
 		jid,
 		await generateWAMessageContent(
 			content,
@@ -379,7 +424,7 @@ export const generateWAMessage = async(
 		),
 		options
 	)
-)
+}
 
 /**
  * Extract the true message content from a message

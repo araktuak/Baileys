@@ -1,6 +1,6 @@
 import { Boom } from '@hapi/boom'
 import { aesDecrypt, hmacSign, aesEncrypt, hkdf } from "./crypto"
-import { WAPatchCreate, ChatMutation, WAPatchName, LTHashState, ChatModification, SignalKeyStore } from "../Types"
+import { WAPatchCreate, ChatMutation, WAPatchName, LTHashState, ChatModification, LastMessageList } from "../Types"
 import { proto } from '../../WAProto'
 import { LT_HASH_ANTI_TAMPERING } from './lt-hash'
 import { BinaryNode, getBinaryNodeChild, getBinaryNodeChildren } from '../WABinary'
@@ -272,7 +272,7 @@ export const extractSyncdPatches = async(result: BinaryNode) => {
     const syncNode = getBinaryNodeChild(result, 'sync')
     const collectionNodes = getBinaryNodeChildren(syncNode, 'collection')
     
-    const final = { } as { [T in WAPatchName]: { patches: proto.ISyncdPatch[], snapshot?: proto.ISyncdSnapshot } }
+    const final = { } as { [T in WAPatchName]: { patches: proto.ISyncdPatch[], hasMorePatches: boolean, snapshot?: proto.ISyncdSnapshot } }
     await Promise.all(
         collectionNodes.map(
             async collectionNode => {
@@ -283,6 +283,8 @@ export const extractSyncdPatches = async(result: BinaryNode) => {
 
                 const syncds: proto.ISyncdPatch[] = []
                 const name = collectionNode.attrs.name as WAPatchName
+
+                const hasMorePatches = collectionNode.attrs.has_more_patches == 'true'
         
                 let snapshot: proto.ISyncdSnapshot | undefined = undefined
                 if(snapshotNode && !!snapshotNode.content) {
@@ -309,7 +311,7 @@ export const extractSyncdPatches = async(result: BinaryNode) => {
                     }
                 }
         
-                final[name] = { patches: syncds, snapshot }
+                final[name] = { patches: syncds, hasMorePatches, snapshot }
             }
         )
     )
@@ -418,11 +420,10 @@ export const decodePatches = async(
 
 export const chatModificationToAppPatch = (
     mod: ChatModification,
-    jid: string,
-    lastMessages: Pick<proto.IWebMessageInfo, 'key' | 'messageTimestamp'>[]
+    jid: string
 ) => {
     const OP = proto.SyncdMutation.SyncdMutationSyncdOperation
-    const getMessageRange = () => {
+    const getMessageRange = (lastMessages: LastMessageList) => {
         if(!lastMessages?.length) {
             throw new Boom('Expected last message to be not from me', { statusCode: 400 })
         }
@@ -455,7 +456,7 @@ export const chatModificationToAppPatch = (
             syncAction: {
                 archiveChatAction: {
                     archived: !!mod.archive,
-                    messageRange: getMessageRange()
+                    messageRange: getMessageRange(mod.lastMessages)
                 }
             },
             index: ['archive', jid],
@@ -468,7 +469,7 @@ export const chatModificationToAppPatch = (
             syncAction: {
                 markChatAsReadAction: {
                     read: mod.markRead,
-                    messageRange: getMessageRange()
+                    messageRange: getMessageRange(mod.lastMessages)
                 }
             },
             index: ['markChatAsRead', jid],
@@ -480,7 +481,7 @@ export const chatModificationToAppPatch = (
         if(mod.clear === 'all') {
             throw new Boom('not supported')
         } else {
-            const key = mod.clear.message
+            const key = mod.clear.messages[0]
             patch = {
                 syncAction: {
                     deleteMessageForMeAction: {

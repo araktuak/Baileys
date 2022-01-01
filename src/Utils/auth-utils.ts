@@ -26,7 +26,7 @@ export const addTransactionCapability = (state: SignalKeyStore, logger: Logger):
 		}
 
 		const dict = transactionCache[type]
-		const idsRequiringFetch = ids.filter(item => !dict?.[item])
+		const idsRequiringFetch = dict ? ids.filter(item => !(item in dict)) : ids
 		// only fetch if there are any items to fetch
 		if(idsRequiringFetch.length) {
 			const result = await state.get(type, idsRequiringFetch)
@@ -112,7 +112,7 @@ export const initAuthCreds = (): AuthenticationCreds => {
 }
 
 /** stores the full authentication state in a single JSON file */
-export const useSingleFileAuthState = (filename: string): { state: AuthenticationState, saveState: () => void } => {
+export const useSingleFileAuthState = (filename: string, logger?: Logger): { state: AuthenticationState, saveState: () => void } => {
 	// require fs here so that in case "fs" is not available -- the app does not crash
 	const { readFileSync, writeFileSync, existsSync } = require('fs')
 	let creds: AuthenticationCreds
@@ -120,7 +120,7 @@ export const useSingleFileAuthState = (filename: string): { state: Authenticatio
 
 	// save the authentication state to a file
 	const saveState = () => {
-		console.log('saving auth state')
+		logger && logger.trace('saving auth state')
 		writeFileSync(
 			filename,
 			// BufferJSON replacer utility saves buffers nicely
