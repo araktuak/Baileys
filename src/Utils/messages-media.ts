@@ -467,15 +467,29 @@ export const getWAUploadToServer = ({ customUploadHosts, fetchAgent, logger }: C
 		let uploadInfo = await refreshMediaConn(false)
 
 		let urls: { mediaUrl: string, directPath: string }
-        const hosts = [ ...customUploadHosts, ...uploadInfo.hosts.map(h => h.hostname) ]
-		for (let hostname of hosts) {
+        const hosts = [ ...customUploadHosts, ...uploadInfo.hosts ]
+
+        let chunks: Buffer[] = []
+        for await(const chunk of stream) {
+            chunks.push(chunk)
+        }
+
+        let reqBody = Buffer.concat(chunks)
+
+		for (let { hostname, maxContentLengthBytes } of hosts) {
+            logger.debug(`uploading to "${hostname}"`)
+
 			const auth = encodeURIComponent(uploadInfo.auth) // the auth token
 			const url = `https://${hostname}${MEDIA_PATH_MAP[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
-			
+			let result: any
 			try {
-				const {data: result} = await axios.post(
+                if(maxContentLengthBytes && reqBody.length > maxContentLengthBytes) {
+                    throw new Boom(`Body too large for "${hostname}"`, { statusCode: 413 })
+                }
+
+				const body = await axios.post(
                     url,
-                    stream,
+                    reqBody,
 					{   
 						headers: { 
 							'Content-Type': 'application/octet-stream',
@@ -488,6 +502,7 @@ export const getWAUploadToServer = ({ customUploadHosts, fetchAgent, logger }: C
                         maxContentLength: Infinity,
 					}
 				)
+                result = body.data
 				
 				if(result?.url || result?.directPath) {
                     urls = {
@@ -500,16 +515,24 @@ export const getWAUploadToServer = ({ customUploadHosts, fetchAgent, logger }: C
 					throw new Error(`upload failed, reason: ${JSON.stringify(result)}`)
 				}
 			} catch (error) {
-				const isLast = hostname === hosts[uploadInfo.hosts.length-1]
-				logger.debug({ trace: error.stack }, `Error in uploading to ${hostname} ${isLast ? '' : ', retrying...'}`)
+                if(axios.isAxiosError(error)) {
+                    result = error.response?.data
+                }
+
+				const isLast = hostname === hosts[uploadInfo.hosts.length-1]?.hostname
+				logger.warn({ trace: error.stack, uploadResult: result }, `Error in uploading to ${hostname} ${isLast ? '' : ', retrying...'}`)
 			}
 		}
-		if (!urls) {
+        // clear buffer just to be sure we're releasing the memory
+        reqBody = undefined
+
+		if(!urls) {
 			throw new Boom(
 				'Media upload failed on all hosts',
 				{ statusCode: 500 }
 			)
 		}
+
 		return urls
 	}
 }
